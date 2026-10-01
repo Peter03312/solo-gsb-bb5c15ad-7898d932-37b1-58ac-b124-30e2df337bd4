@@ -113,6 +113,7 @@ def _crl_entry_dict(row) -> dict:
 
 
 def _approval_dict(row) -> dict:
+    frozen_windows = json.loads(row["frozen_windows"]) if row["frozen_windows"] else None
     return {
         "id": row["id"],
         "plan_id": row["plan_id"],
@@ -120,6 +121,10 @@ def _approval_dict(row) -> dict:
         "crl_snapshot_version": row["crl_snapshot_version"],
         "cert_fingerprints": json.loads(row["cert_fingerprints"]),
         "verdict": json.loads(row["verdict_json"]),
+        "frozen_windows": frozen_windows,
+        # 仅本轮改造后、带冻结窗口依据的批准可离线复核；既有批准为 False，
+        # 证据包接口会显式返回不可复核，不能用当前窗口补齐。
+        "replayable": frozen_windows is not None,
         "superseded": bool(row["superseded"]),
         "created_at": row["created_at"],
     }
@@ -804,41 +809,26 @@ def _assess_window(window, cert_row, roots, domain, eval_start, eval_end, snapsh
     return report, intervals
 
 
-def _compute_evaluation(
-    conn,
+def _evaluation_from_materials(
     domain,
     eval_start,
     eval_end,
     version,
     snapshot_version,
-    windows=None,
+    windows,
+    roots,
+    snapshot,
+    certs_by_fp,
 ) -> dict:
-    """纯评估计算：读取信任根/快照/证书与窗口集合，不写入任何历史。
+    """纯评估计算：调用方负责备齐窗口集合、信任根、快照与证书材料。
 
-    windows 为 None 时使用库中该域名的当前窗口集合；否则使用给定的候选
-    集合（元素为含 id/certificate_fingerprint/role/start_utc/end_utc 的
-    映射，候选新窗口的 id 为 None）。供计划评估与窗口变更预演共用。
+    证据包离线复核与库内评估共用本函数，保证「同一套覆盖 / X.509 / 撤销
+    规则」，复核不读取任何业务数据。
     """
-    root_row = conn.execute(
-        "SELECT * FROM trust_roots WHERE version = ?", (version,)
-    ).fetchone()
-    if root_row is None:
-        raise ApiError(404, f"unknown trust root version '{version}'")
-    roots = certutils.parse_pem_chain(root_row["pem"])
-    snapshot = _load_snapshot(conn, snapshot_version)
-    if windows is None:
-        windows = conn.execute(
-            "SELECT * FROM service_windows WHERE domain = ? ORDER BY start_utc, id",
-            (domain,),
-        ).fetchall()
-
     usable: list[tuple[datetime, datetime]] = []
     reports = []
     for w in windows:
-        cert_row = conn.execute(
-            "SELECT * FROM certificates WHERE fingerprint_sha256 = ?",
-            (w["certificate_fingerprint"],),
-        ).fetchone()
+        cert_row = certs_by_fp.get(w["certificate_fingerprint"])
         report, intervals = _assess_window(
             w, cert_row, roots, domain, eval_start, eval_end, snapshot
         )
@@ -857,6 +847,48 @@ def _compute_evaluation(
         "certificates": reports,
         "evaluated_at": iso_z(now_utc()),
     }
+
+
+def _compute_evaluation(
+    conn,
+    domain,
+    eval_start,
+    eval_end,
+    version,
+    snapshot_version,
+    windows=None,
+) -> dict:
+    """读取信任根/快照/证书与窗口集合后计算评估，不写入任何历史。
+
+    windows 为 None 时使用库中该域名的当前窗口集合；否则使用给定的候选
+    集合（元素为含 id/certificate_fingerprint/role/start_utc/end_utc 的
+    映射，候选新窗口的 id 为 None）。供计划评估与窗口变更预演共用。
+    """
+    root_row = conn.execute(
+        "SELECT * FROM trust_roots WHERE version = ?", (version,)
+    ).fetchone()
+    if root_row is None:
+        raise ApiError(404, f"unknown trust root version '{version}'")
+    roots = certutils.parse_pem_chain(root_row["pem"])
+    snapshot = _load_snapshot(conn, snapshot_version)
+    if windows is None:
+        windows = conn.execute(
+            "SELECT * FROM service_windows WHERE domain = ? ORDER BY start_utc, id",
+            (domain,),
+        ).fetchall()
+
+    certs_by_fp: dict[str, object] = {}
+    for w in windows:
+        fp = w["certificate_fingerprint"]
+        if fp not in certs_by_fp:
+            certs_by_fp[fp] = conn.execute(
+                "SELECT * FROM certificates WHERE fingerprint_sha256 = ?", (fp,)
+            ).fetchone()
+
+    return _evaluation_from_materials(
+        domain, eval_start, eval_end, version, snapshot_version,
+        windows, roots, snapshot, certs_by_fp,
+    )
 
 
 def _evaluate(conn, plan_id, domain, eval_start, eval_end, version, snapshot_version) -> dict:
@@ -1025,27 +1057,32 @@ def approve_plan(plan_id: int) -> dict:
                 f"plan has {len(verdict['gaps'])} coverage gap(s);"
                 " only gap-free plans can be approved",
             )
-        fps = sorted(
+        # 窗口集合与判定在同一一致性边界冻结：实际参与本次判定的窗口直接
+        # 取自该冻结判定（不可变评估历史），不再事后查询「当前」窗口，
+        # 因而后续窗口增删、信任根/快照切换或再次批准均无法改写本包依据。
+        frozen_windows = [
             {
-                r["certificate_fingerprint"]
-                for r in conn.execute(
-                    "SELECT DISTINCT certificate_fingerprint FROM service_windows"
-                    " WHERE domain = ?",
-                    (plan["domain"],),
-                ).fetchall()
+                "window_id": c.get("window_id"),
+                "certificate_fingerprint": c["fingerprint"],
+                "role": c["role"],
+                "start": c["window"]["start"],
+                "end": c["window"]["end"],
             }
-        )
+            for c in verdict["certificates"]
+        ]
+        fps = sorted({w["certificate_fingerprint"] for w in frozen_windows})
         ts = iso_z(now_utc())
         cur = conn.execute(
             "INSERT INTO approvals (plan_id, trust_root_version, crl_snapshot_version,"
-            " cert_fingerprints, verdict_json, superseded, created_at)"
-            " VALUES (?, ?, ?, ?, ?, 0, ?)",
+            " cert_fingerprints, verdict_json, frozen_windows, superseded, created_at)"
+            " VALUES (?, ?, ?, ?, ?, ?, 0, ?)",
             (
                 plan_id,
                 ev["trust_root_version"],
                 ev["crl_snapshot_version"],
                 json.dumps(fps),
                 ev["result_json"],
+                json.dumps(frozen_windows),
                 ts,
             ),
         )
@@ -1120,6 +1157,46 @@ def list_approvals(plan_id: int) -> list[dict]:
             "SELECT * FROM approvals WHERE plan_id = ? ORDER BY id", (plan_id,)
         ).fetchall()
     return [_approval_dict(r) for r in rows]
+
+
+# ---------------------------------------------------------------------------
+# 运维审计证据包（生成侧；复核侧见 app.evidence，零业务库访问）
+# ---------------------------------------------------------------------------
+
+def get_approval_record(conn, plan_id: int, approval_id: int):
+    _get_plan(conn, plan_id)
+    row = conn.execute(
+        "SELECT * FROM approvals WHERE id = ? AND plan_id = ?",
+        (approval_id, plan_id),
+    ).fetchone()
+    if row is None:
+        raise ApiError(404, f"unknown approval id {approval_id} for plan {plan_id}")
+    return row
+
+
+def download_evidence_package(plan_id: int, approval_id: int) -> tuple[bytes, str, dict]:
+    """生成某次批准的可下载证据包（只读，不改动任何业务数据）。
+
+    既有批准缺少冻结窗口依据时返回 409 approval_not_replayable，绝不按
+    当前窗口补齐。
+    """
+    from . import evidence
+
+    with db.connect() as conn:
+        approval = get_approval_record(conn, plan_id, approval_id)
+        if not approval["frozen_windows"]:
+            raise evidence.EvidenceError(
+                409,
+                "approval_not_replayable",
+                f"approval #{approval_id} of plan {plan_id} predates window-set"
+                " freezing and has no restorable window basis; it cannot be"
+                " replayed on an offline machine and no evidence package can be"
+                " produced for it (current windows must not be back-filled)",
+            )
+        payload = evidence.build_evidence_package(conn, approval)
+        filename = evidence.package_filename(approval)
+        meta = _approval_dict(approval)
+    return payload, filename, meta
 
 
 # ---------------------------------------------------------------------------

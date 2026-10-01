@@ -3,10 +3,10 @@ from __future__ import annotations
 
 import contextlib
 
-from fastapi import FastAPI, Query, Request
-from fastapi.responses import JSONResponse
+from fastapi import FastAPI, File, Query, Request, UploadFile
+from fastapi.responses import JSONResponse, Response
 
-from . import db, service
+from . import db, evidence, service
 from .models import (
     CertificateImport,
     CrlSnapshotImport,
@@ -29,11 +29,12 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="TLS Certificate Renewal Verification Service",
-    version="1.0.0",
+    version="1.1.0",
     description=(
         "离线 TLS 证书换发核验服务：导入 PEM 证书链与分版本信任根，"
         "登记证书服务窗口，校验 X.509 链并评估指定区间内的证书覆盖断档，"
-        "仅无断档计划可批准。"
+        "仅无断档计划可批准；支持针对批准记录导出审计证据包并在离线机器上"
+        "仅用包内材料复核。"
     ),
     lifespan=lifespan,
 )
@@ -41,7 +42,11 @@ app = FastAPI(
 
 @app.exception_handler(service.ApiError)
 async def api_error_handler(request: Request, exc: service.ApiError):
-    return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
+    content = {"detail": exc.detail}
+    code = getattr(exc, "code", None)
+    if code:
+        content["code"] = code
+    return JSONResponse(status_code=exc.status_code, content=content)
 
 
 @app.get("/")
@@ -252,3 +257,51 @@ def plan_evaluations(plan_id: int):
 def plan_approvals(plan_id: int):
     """批准历史（含被取代的冻结判定，全部保留）。"""
     return {"items": service.list_approvals(plan_id)}
+
+
+# ----------------------------- 运维审计证据包 -----------------------------
+
+@app.get(
+    f"{API}/plans/{{plan_id}}/approvals/{{approval_id}}/evidence",
+    tags=["audit-evidence"],
+)
+def download_approval_evidence(plan_id: int, approval_id: int):
+    """下载某次批准的离线审计证据包（ZIP，只读，不改动任何业务数据）。
+
+    包含该次批准的域名与评估区间、判定、实际参与评估的服务窗口集合、
+    证书链、信任根版本 PEM 与所选用的 CRL 快照 PEM，逐文件 SHA-256
+    摘要写入清单。窗口集合与判定在批准的同一一致性边界冻结。
+
+    本轮改造前的既有批准缺少可还原的窗口依据 → 409
+    ``approval_not_replayable``（不能按当前窗口补齐）；未知计划/批准 → 404。
+    """
+    payload, filename, _meta = service.download_evidence_package(plan_id, approval_id)
+    return Response(
+        content=payload,
+        media_type="application/zip",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@app.post(f"{API}/evidence/verify", tags=["audit-evidence"])
+async def verify_evidence(package: UploadFile = File(...)):
+    """在本机仅用证据包内材料复核一次批准：重算覆盖、X.509 链与撤销结论。
+
+    请求体为 ``multipart/form-data``（字段名 ``package``，ZIP 文件）或
+    直接 ``application/zip`` 上传。复核全程不读取、不导入、不修改任何
+    当前业务数据。
+
+    - 材料齐全且重算与冻结判定逐字段一致 → 200 ``consistent``；
+    - 结论对不上 → 200 ``inconsistent`` 并给出 ``differences``；
+    - 缺项 / 指纹不符 / 版本不符 / 非法时间 / 摘要不符 → 4xx，带
+      ``code`` 与可解释 ``detail``。
+    """
+    raw = await package.read(evidence.MAX_PACKAGE_BYTES + 1)
+    if len(raw) > evidence.MAX_PACKAGE_BYTES:
+        raise evidence.EvidenceError(
+            413,
+            "package_too_large",
+            f"evidence package exceeds the {evidence.MAX_PACKAGE_BYTES // 1024 // 1024}"
+            " MiB limit",
+        )
+    return evidence.verify_evidence_package(raw)

@@ -56,8 +56,21 @@ python -m pytest tests/ -q
   评估时刻须落在整条链的有效期交集内。
 - **断档评估**：在 `[eval_start, eval_end)` 内，每一时刻至少一张证书
   「处于服务窗口且验证通过」。返回全部断档区间与每张证书的不可用原因。
-- **批准与冻结**：仅无断档计划可批准；批准时冻结证书指纹集合、信任根版本、
-  撤销快照版本与判定结果。
+- **批准与冻结**：仅无断档计划可批准；批准时在**同一一致性边界**冻结
+  证书指纹集合、实际参与评估的服务窗口集合、信任根版本、撤销快照版本与
+  判定结果。冻结的窗口依据直接取自该次判定（不可变评估历史），后续窗口
+  增删、信任根/快照切换或再次批准均无法改写；每次批准各自独立冻结。
+- **审计证据包（离线复核）**：可针对任一批准下载自包含的 ZIP 证据包
+  （`GET .../approvals/{id}/evidence`），内含该次批准的域名与评估区间、
+  判定、实际参评服务窗口、证书链、信任根 PEM 与所选 CRL 快照 PEM，
+  逐文件 SHA-256 摘要写入清单；证据包字节可复现（确定性打包）。复核端
+  `POST /evidence/verify` **只使用包内材料**重算覆盖、X.509 链与撤销
+  结论，不读取/导入/修改当前业务数据：逐字段一致 → `consistent`；
+  材料合法但结论对不上 → `inconsistent` 并给出 `differences`；缺项、
+  指纹不符、版本不符、非法时间、摘要不符等 → 带 `code` 的可解释错误。
+  **本轮改造前的既有批准**缺少可还原的窗口依据，证据包接口明确返回
+  `409 approval_not_replayable`，不会按当前窗口补齐；批准历史中的
+  `replayable` 字段标识某条批准是否可复核。
 - **待复核**：信任根换版、撤销快照切换或服务窗口增删后，相关已批准计划自动
   转为 `pending_review`；历史评估与历史批准（含冻结判定）全部保留，
   重新评估无断档后可再次批准。
@@ -108,7 +121,9 @@ python -m pytest tests/ -q
 | POST | `/plans/{id}/evaluate` | 重新评估（可换信任根版本/快照；省略沿用，null 取消快照） |
 | POST | `/plans/{id}/approve` | 批准（仅无断档，冻结快照版本） |
 | GET | `/plans/{id}/evaluations` | 评估历史 |
-| GET | `/plans/{id}/approvals` | 批准历史（冻结判定） |
+| GET | `/plans/{id}/approvals` | 批准历史（冻结判定；`replayable` 标识可否复核） |
+| GET | `/plans/{id}/approvals/{approval_id}/evidence` | 下载批准的离线审计证据包（ZIP） |
+| POST | `/evidence/verify` | 仅用证据包内材料离线复核（multipart 上传 ZIP） |
 
 ## 调用示例
 
@@ -313,12 +328,88 @@ curl -s -X POST http://localhost:8000/api/v1/window-changes/commit \
 # - 空变更/重复删除/跨域删除/无效区间 → 400；未知窗口/证书指纹 → 404
 ```
 
+### 11. 导出批准证据包并在离线机器复核
+
+证据包把一次批准的**完整判定依据**打包为自包含 ZIP：`manifest.json`
+（格式、批准标识、域名、评估区间、版本、窗口数、逐文件 SHA-256 摘要）、
+`verdict.json`（冻结判定）、`windows.json`（实际参评窗口）、
+`materials/trust-root.pem`、`materials/certificates/<指纹>.pem`，以及选择了
+撤销快照时的 `materials/crl-snapshot.pem`。
+
+```bash
+# 11.1 取计划 #1 当前有效批准（批准历史新增 replayable 字段）
+curl -s http://localhost:8000/api/v1/plans/1/approvals
+# → 本轮新批准: {"id":4,"replayable":true,"frozen_windows":[...], ...}
+# → 本轮改造前的既有批准: {"replayable":false,"frozen_windows":null, ...}
+
+# 11.2 下载证据包（只读，不改动任何业务数据）
+curl -s -o approval-4-evidence.pkb.zip \
+  http://localhost:8000/api/v1/plans/1/approvals/4/evidence
+python3 -c "import zipfile;print(zipfile.ZipFile('approval-4-evidence.pkb.zip').namelist())"
+# ['manifest.json', 'verdict.json', 'windows.json',
+#  'materials/trust-root.pem', 'materials/certificates/<fp>.pem', ...]
+
+# 11.3 把 ZIP 拷到离线复核机，只用包内材料重算覆盖 / X.509 / 撤销
+curl -s -X POST http://offline-box:8000/api/v1/evidence/verify \
+  -F "package=@approval-4-evidence.pkb.zip;type=application/zip"
+```
+
+一致时：
+
+```json
+{
+  "result": "consistent",
+  "format": "tls-checker-evidence/1",
+  "approval_id": 4, "plan_id": 1,
+  "domain": "demo.example.com",
+  "eval_interval": {"start": "2026-01-01T00:00:00.000Z", "end": "2027-01-01T00:00:00.000Z"},
+  "trust_root_version": "demo-root-v1",
+  "crl_snapshot_version": null,
+  "window_count": 3,
+  "cert_fingerprints": ["…", "…", "…"],
+  "differences": [],
+  "frozen_verdict": { "…冻结判定…" },
+  "recomputed_verdict": { "…仅用包内材料重算的判定…" }
+}
+```
+
+材料合法但重算结论与冻结判定对不上时，HTTP 仍为 200，`result` 为
+`inconsistent`，`differences` 逐字段给出差异（如 `has_gaps`、`gaps`、
+逐窗口 `usable_intervals` / `reasons` / `revocation`）。
+
+```bash
+# 11.4 复核机不导入任何材料；缺项/指纹不符/版本不符/非法时间 → 可解释错误
+# HTTP 4xx，body: {"detail": "...", "code": "<错误码>"}
+```
+
+| HTTP | `code` | 触发情形 |
+|---|---|---|
+| 409 | `approval_not_replayable` | 既有批准无冻结窗口依据，不可复核（不用当前窗口补齐） |
+| 404 | — | 未知计划 / 批准 ID |
+| 400 | `malformed_package` | 非 ZIP、结构损坏、路径不安全、JSON 非法、窗口/指纹字段非法 |
+| 400 | `missing_material` | 缺少清单声明的必需文件或摘要项 |
+| 400 | `invalid_time` | 时间戳无法解析、缺时区、`start >= end`、CRL 时间倒置 |
+| 400 | `invalid_trust_root` / `invalid_certificate` / `invalid_crl` | 包内 PEM 无法解析 |
+| 422 | `unsupported_format` | 证据包格式版本不受支持 |
+| 422 | `digest_mismatch` | 文件 SHA-256 与清单摘要不符（材料被改动） |
+| 422 | `fingerprint_mismatch` | 证书叶子指纹与文件名/窗口声明不符 |
+| 422 | `manifest_mismatch` | 冻结判定与清单头不一致（区间/版本/窗口数等） |
+| 422 | `frozen_basis_mismatch` | `windows.json` 与判定的参评窗口不一致（非同一一致性边界） |
+| 422 | `frozen_verdict_invalid` | 冻结判定本身有断档（不可能是有效批准） |
+| 422 | `crl_signature_invalid` | 包内 CRL 在包内 CA 中找不到有效签发者 |
+| 413 | `package_too_large` | 证据包超过 16 MiB |
+
+> 复核过程零业务库访问：即使在原机器上对同一服务调用
+> `/evidence/verify`，也不会读取或改动当前窗口、信任根、快照、评估与
+> 批准，结论只取决于上传的包。
+
 ## 项目结构
 
 ```
 app/
   main.py       FastAPI 路由
-  service.py    业务逻辑（导入/窗口/CRL 快照/评估/批准/待复核）
+  service.py    业务逻辑（导入/窗口/CRL 快照/评估/批准/待复核/证据包生成）
+  evidence.py   审计证据包：确定性 ZIP 装配与仅用包内材料的离线复核
   certutils.py  PEM 解析、签名链构建、CA 约束与 SAN 校验
   crlutils.py   PEM CRL 解析、签发者匹配与签名验证
   coverage.py   半开区间断档与求交计算
@@ -326,8 +417,19 @@ app/
   models.py     请求模型（时区强制、域名归一化）
 scripts/
   seed_demo.py  离线生成演示 CA/证书/CRL 并初始化演示数据（幂等）
-  demo.sh       端到端 curl 调用示例
+  demo.sh       端到端 curl 调用示例（含证据包导出/离线复核）
   docker-entrypoint.sh
-tests/          pytest 测试（72 例，覆盖全部拒绝规则、CRL 证据、复核流程与窗口变更预演/提交）
+tests/          pytest 测试（96 例，覆盖全部拒绝规则、CRL 证据、复核流程、
+                窗口变更预演/提交，以及审计证据包冻结/导出/篡改/不可复核）
 Dockerfile / docker-compose.yml
 ```
+
+## 本轮变动（审计证据包）
+
+- 批准在原有冻结基础上**新增冻结实际参评服务窗口集合**（`approvals.frozen_windows`，
+  经轻量迁移自动加列）；窗口集合与判定取自同一次不可变评估，处于同一一致性边界。
+- 新增证据包下载与离线复核两个 HTTP 接口；依赖新增 `python-multipart`（上传）。
+- 批准历史与批准响应新增 `frozen_windows`、`replayable` 两个只读字段，
+  其余既有接口的请求/响应语义保持不变。
+- 既有批准（迁移前产生、无冻结窗口）一律 `replayable=false`，证据包接口返回
+  `409 approval_not_replayable`；重新评估并**再次批准**后生成的新批准可正常出包。

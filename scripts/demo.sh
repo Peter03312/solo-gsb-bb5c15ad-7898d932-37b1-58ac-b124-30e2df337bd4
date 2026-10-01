@@ -157,4 +157,44 @@ curl -s -w "\nHTTP %{http_code}\n" -X POST "$BASE/window-changes/commit" \
   -H 'Content-Type: application/json' \
   -d "{\"domain\":\"demo.example.com\",\"change_token\":\"$TOKEN\",\"delete_window_ids\":[$CUR_WIN],\"add_windows\":[{\"certificate_fingerprint\":\"$CUR_FP\",\"role\":\"current\",\"start\":\"2026-01-01T00:00:00Z\",\"end\":\"2026-07-01T00:00:00Z\"}]}"
 
+echo "==> 13. 运维审计证据包：导出 → 拷贝到离线机器 → 仅用包内材料复核"
+# 取计划 #1 当前（非 superseded）批准的 id
+APR_ID=$(curl -s "$BASE/plans/1/approvals" \
+  | python3 -c "import json,sys;print([a['id'] for a in json.load(sys.stdin)['items'] if not a['superseded']][-1])")
+echo "-- 13.1 下载证据包（域名/区间/判定/实际参评窗口/证书链/信任根/CRL 快照 + 摘要）"
+curl -s -D - -o /tmp/approval-evidence.zip "$BASE/plans/1/approvals/$APR_ID/evidence" \
+  | grep -Ei 'HTTP/|content-type|content-disposition'
+python3 - <<'PYEOF'
+import json, zipfile
+with zipfile.ZipFile("/tmp/approval-evidence.zip") as zf:
+    names = zf.namelist()
+    manifest = json.loads(zf.read("manifest.json"))
+print("zip entries:", *names, sep="\n  ")
+print("format =", manifest["format"], "| domain =", manifest["domain"],
+      "| interval =", manifest["eval_interval"], "| windows =", manifest["window_count"])
+PYEOF
+
+echo "-- 13.2 在本机（模拟离线复核机）只凭证据包重算覆盖/X.509/撤销"
+curl -s -X POST "$BASE/evidence/verify" -F "package=@/tmp/approval-evidence.zip;type=application/zip" \
+  | python3 -c "
+import json,sys
+d=json.load(sys.stdin)
+print('result =', d['result'])
+print('differences =', d['differences'])
+print('trust root =', d['trust_root_version'], '| crl snapshot =', d['crl_snapshot_version'])"
+
+echo "-- 13.3 证据包被篡改（删除一个证书材料）→ 可解释错误（缺项）"
+python3 - <<'PYEOF'
+import zipfile
+with zipfile.ZipFile("/tmp/approval-evidence.zip") as src:
+    cert = [n for n in src.namelist() if n.startswith("materials/certificates/")][0]
+    with zipfile.ZipFile("/tmp/tampered.zip", "w", zipfile.ZIP_DEFLATED) as dst:
+        for n in src.namelist():
+            if n != cert:
+                dst.writestr(n, src.read(n))
+print("dropped", cert)
+PYEOF
+curl -s -w "\nHTTP %{http_code}\n" -X POST "$BASE/evidence/verify" \
+  -F "package=@/tmp/tampered.zip;type=application/zip"
+
 echo "demo done."

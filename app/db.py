@@ -69,6 +69,7 @@ CREATE TABLE IF NOT EXISTS approvals (
     trust_root_version  TEXT NOT NULL,
     cert_fingerprints   TEXT NOT NULL,          -- JSON 数组，批准时冻结
     verdict_json        TEXT NOT NULL,          -- 批准时冻结的判定结果
+    frozen_windows      TEXT,                   -- JSON 数组，批准同一一致性边界冻结的实际参评窗口
     superseded          INTEGER NOT NULL DEFAULT 0,
     created_at          TEXT NOT NULL
 );
@@ -100,11 +101,13 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_crl_entries_issuer
 """
 
 # 既有库的轻量迁移：计划/评估/批准各增加撤销快照版本列（NULL = 未选择快照，
-# 保持原评估与响应语义）。
+# 保持原评估与响应语义）；批准增加冻结窗口集合列（NULL = 本轮改造前的
+# 既有批准，缺少可还原的窗口依据，不可生成证据包/不可离线复核）。
 _COLUMN_MIGRATIONS = (
     ("plans", "crl_snapshot_version", "TEXT"),
     ("evaluations", "crl_snapshot_version", "TEXT"),
     ("approvals", "crl_snapshot_version", "TEXT"),
+    ("approvals", "frozen_windows", "TEXT"),
 )
 
 
