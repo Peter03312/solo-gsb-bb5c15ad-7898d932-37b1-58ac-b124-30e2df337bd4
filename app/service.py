@@ -9,7 +9,7 @@ from datetime import datetime, timezone
 from cryptography import x509
 from cryptography.hazmat.primitives import serialization
 
-from . import certutils, coverage, crlutils, db
+from . import certutils, crlutils, db, evidence
 
 
 class ApiError(Exception):
@@ -122,6 +122,9 @@ def _approval_dict(row) -> dict:
         "verdict": json.loads(row["verdict_json"]),
         "superseded": bool(row["superseded"]),
         "created_at": row["created_at"],
+        # 本轮新批准随同一一致性边界冻结了窗口集合 → 可导出/复核证据包；
+        # 既有批准该列为 NULL，缺少可还原窗口依据 → 不可复核（不按当前窗口补齐）。
+        "evidence_reviewable": row["frozen_windows_json"] is not None,
     }
 
 
@@ -413,34 +416,6 @@ def get_crl_snapshot(version: str) -> dict:
     return result
 
 
-def _load_snapshot(conn, version: str | None):
-    """载入快照条目（按签发者键索引）。version 为 None 表示不使用快照。"""
-    if version is None:
-        return None
-    snap = conn.execute(
-        "SELECT * FROM crl_snapshots WHERE version = ?", (version,)
-    ).fetchone()
-    if snap is None:
-        raise ApiError(404, f"unknown CRL snapshot version '{version}'")
-    by_issuer: dict[tuple[str, str], list] = {}
-    rows = conn.execute(
-        "SELECT * FROM crl_entries WHERE snapshot_id = ?", (snap["id"],)
-    ).fetchall()
-    for row in rows:
-        try:
-            crl = crlutils.parse_pem_crls(row["pem"])[0]
-        except crlutils.PemCrlError as exc:
-            # 存储内容不可解析属于内部不一致：绝不静默放行
-            raise ApiError(
-                500,
-                f"stored CRL for issuer '{row['issuer_dn']}' is unreadable: {exc}",
-            ) from exc
-        by_issuer.setdefault((row["issuer_dn"], row["issuer_key_id"]), []).append(
-            (row, crl)
-        )
-    return {"version": version, "by_issuer": by_issuer}
-
-
 # ---------------------------------------------------------------------------
 # 证书链导入
 # ---------------------------------------------------------------------------
@@ -572,236 +547,15 @@ def delete_window(window_id: int) -> dict:
 # 评估
 # ---------------------------------------------------------------------------
 
-def _short_subject(cert) -> str:
-    cn = cert.subject.rfc4514_string()
-    return cn.split(",", 1)[0] if "," in cn else cn
-
-
-def _crl_sign_ok(ca) -> bool:
-    try:
-        ku = ca.extensions.get_extension_for_class(x509.KeyUsage).value
-    except x509.ExtensionNotFound:
-        return True
-    return ku.crl_sign
-
-
-def _revocation_evidence(child, issuer, snapshot, w_start, w_end):
-    """为链上一张非根证书解析其签发者 CRL 证据。
-
-    返回 (成员报告, 该成员的撤销可用区间列表)。缺失/过期/已撤销均计入断档。
-    """
-    subj = issuer.subject.rfc4514_string()
-    member = {
-        "subject": child.subject.rfc4514_string(),
-        "issuer": subj,
-        "serial_number": format(child.serial_number, "X"),
-        "crl": None,
-        "reasons": [],
+def _window_as_evidence(w) -> dict:
+    """DB 行或候选窗口映射 → 证据引擎使用的冻结窗口结构。"""
+    return {
+        "window_id": w["id"],
+        "certificate_fingerprint": w["certificate_fingerprint"],
+        "role": w["role"],
+        "start": w["start_utc"],
+        "end": w["end_utc"],
     }
-    reasons: list[str] = []
-    clean: list[tuple[datetime, datetime]] = []
-    label = _short_subject(child)
-
-    candidates = snapshot["by_issuer"].get(crlutils.issuer_key(issuer), [])
-    # issuer_key 含 SKI；CRL 无 AKI 时再按 DN 兜底匹配
-    if not candidates:
-        candidates = [
-            pair
-            for key, pairs in snapshot["by_issuer"].items()
-            if key[0] == issuer.subject.rfc4514_string()
-            for pair in pairs
-        ]
-        candidates = [
-            (row, crl) for row, crl in candidates if crlutils.crl_aki_matches(crl, issuer)
-        ]
-    matched = [
-        (row, crl)
-        for row, crl in candidates
-        if crlutils.verify_crl_issued_by(crl, issuer)
-    ]
-    if not matched:
-        reason = (
-            f"no CRL signed by issuer '{subj}' found in snapshot"
-            f" '{snapshot['version']}'"
-        )
-        reasons.append(reason)
-        member["reasons"].append(reason)
-        return member, clean, [f"{label}: {reason}"]
-    if len({r["id"] for r, _ in matched}) > 1:
-        # 存储层已保证同签发者唯一；防御性处理，绝不静默选择
-        reason = f"multiple CRLs for issuer '{subj}' in snapshot"
-        reasons.append(reason)
-        member["reasons"].append(reason)
-        return member, clean, [f"{label}: {reason}"]
-
-    row, crl = matched[0]
-    if not _crl_sign_ok(issuer):
-        reason = f"issuer '{subj}' keyUsage lacks cRLSign"
-        reasons.append(reason)
-        member["reasons"].append(reason)
-        return member, clean, [f"{label}: {reason}"]
-
-    tu = crl.last_update_utc
-    nu = crl.next_update_utc
-    member["crl"] = {
-        "issuer": subj,
-        "crl_number": row["crl_number"],
-        "this_update": iso_z(tu),
-        "next_update": iso_z(nu),
-        "revoked": None,
-    }
-    valid: list[tuple[datetime, datetime]] = []
-    if nu <= w_start:
-        reasons.append(
-            f"CRL from issuer '{subj}' expired at {iso_z(nu)},"
-            f" before window start {iso_z(w_start)}"
-        )
-    elif tu >= w_end:
-        reasons.append(
-            f"CRL from issuer '{subj}' not valid until {iso_z(tu)},"
-            f" after window end {iso_z(w_end)}"
-        )
-    else:
-        s, e = max(tu, w_start), min(nu, w_end)
-        if s < e:
-            valid.append((s, e))
-        if tu > w_start:
-            reasons.append(
-                f"CRL from issuer '{subj}' not valid until {iso_z(tu)},"
-                f" after window start {iso_z(w_start)}: coverage missing before that"
-            )
-        if nu < w_end:
-            reasons.append(
-                f"CRL from issuer '{subj}' expires at {iso_z(nu)},"
-                f" before window end {iso_z(w_end)}: coverage missing after that"
-            )
-
-    rc = crl.get_revoked_certificate_by_serial_number(child.serial_number)
-    revoked_at: datetime | None = None
-    if rc is not None:
-        revoked_at = rc.revocation_date_utc
-        rreason = crlutils.revoked_reason(rc)
-        member["crl"]["revoked"] = {
-            "effective_at": iso_z(revoked_at),
-            "reason": rreason,
-        }
-
-    # 撤销可用区间 = CRL 有效且尚未到撤销生效时刻；[thisUpdate, nextUpdate) 半开，
-    # 撤销时刻本身起不可用。端点相接（revoked_at == 某边界）不算断档。
-    for s, e in valid:
-        if revoked_at is not None:
-            e2 = min(e, revoked_at)
-            if s < e2:
-                clean.append((s, e2))
-        else:
-            if s < e:
-                clean.append((s, e))
-
-    if revoked_at is not None:
-        reasons.append(
-            f"certificate {label} (serial {format(child.serial_number, 'X')})"
-            f" revoked at {iso_z(revoked_at)}"
-        )
-
-    member["reasons"] = reasons
-    flat = [f"{label}: {r}" for r in reasons]
-    return member, clean, flat
-
-
-def _assess_window(window, cert_row, roots, domain, eval_start, eval_end, snapshot=None):
-    """评估单个服务窗口：返回 (报告, 可用区间列表)。
-
-    可用区间 = 窗口 ∩ 评估区间 ∩ 证书链有效期（启用快照时再 ∩ 逐证书
-    撤销可用区间），且证书须通过全部 X.509 校验。
-    """
-    w_start = max(parse_ts(window["start_utc"]), eval_start)
-    w_end = min(parse_ts(window["end_utc"]), eval_end)
-    reasons: list[str] = []
-    intervals: list[tuple[datetime, datetime]] = []
-    sans: list[str] = json.loads(cert_row["san_dns"]) if cert_row else []
-    revocation: list[dict] = []
-
-    if cert_row is None:
-        reasons.append(
-            f"certificate {window['certificate_fingerprint']} not found in inventory"
-        )
-    else:
-        try:
-            certs = certutils.parse_pem_chain(cert_row["chain_pem"])
-            leaf, intermediates = certs[0], certs[1:]
-            sans = certutils.san_dns_names(leaf)
-            if not sans:
-                raise certutils.ChainValidationError(
-                    "leaf certificate has no DNS subjectAltName"
-                )
-            if not certutils.san_matches(sans, domain):
-                raise certutils.ChainValidationError(
-                    f"SAN {sans} does not match domain '{domain}'"
-                )
-            chain = certutils.build_chain(leaf, intermediates, roots)
-        except certutils.PemParseError as exc:
-            reasons.append(f"stored certificate PEM unreadable: {exc}")
-        except certutils.ChainValidationError as exc:
-            reasons.append(str(exc))
-        else:
-            if w_start >= w_end:
-                reasons.append("service window does not overlap the evaluation interval")
-            else:
-                nb, na = certutils.chain_validity_interval(chain)
-                s, e = max(w_start, nb), min(w_end, na)
-                valid_intervals: list[tuple[datetime, datetime]] = (
-                    [(s, e)] if s < e else []
-                )
-                if nb > w_start:
-                    reasons.append(
-                        f"certificate chain not valid until {iso_z(nb)},"
-                        f" after window start {iso_z(w_start)}"
-                    )
-                if na < w_end:
-                    reasons.append(
-                        f"certificate chain expires at {iso_z(na)},"
-                        f" before window end {iso_z(w_end)}"
-                    )
-                if not valid_intervals and not reasons:
-                    reasons.append(
-                        "certificate validity does not overlap the service window"
-                    )
-
-                if snapshot is not None:
-                    # 链上每张非根证书（叶子 + 中间证书）都必须有签发者 CRL；
-                    # 撤销可用 = 全体成员干净时段的交集（缺一即断档）。
-                    acc: list[tuple[datetime, datetime]] | None = None
-                    for idx in range(len(chain) - 1):
-                        member, clean, flat = _revocation_evidence(
-                            chain[idx], chain[idx + 1], snapshot, w_start, w_end
-                        )
-                        revocation.append(member)
-                        reasons.extend(flat)
-                        acc = clean if acc is None else coverage.intersect(acc, clean)
-                    valid_intervals = [
-                        (max(s, cs), min(e, ce))
-                        for s, e in valid_intervals
-                        for cs, ce in (acc or [])
-                        if max(s, cs) < min(e, ce)
-                    ]
-
-                intervals = valid_intervals
-
-    report = {
-        "window_id": window["id"],
-        "fingerprint": window["certificate_fingerprint"],
-        "role": window["role"],
-        "window": {"start": window["start_utc"], "end": window["end_utc"]},
-        "subject": cert_row["subject"] if cert_row else None,
-        "sans": sans,
-        "usable_intervals": [
-            {"start": iso_z(s), "end": iso_z(e)} for s, e in intervals
-        ],
-        "reasons": reasons,
-    }
-    if snapshot is not None:
-        report["revocation"] = revocation
-    return report, intervals
 
 
 def _compute_evaluation(
@@ -818,45 +572,55 @@ def _compute_evaluation(
     windows 为 None 时使用库中该域名的当前窗口集合；否则使用给定的候选
     集合（元素为含 id/certificate_fingerprint/role/start_utc/end_utc 的
     映射，候选新窗口的 id 为 None）。供计划评估与窗口变更预演共用。
+
+    计算本身与离线证据包复核共用同一纯函数（evidence.compute_from_materials），
+    保证服务方判定与复核方重算完全一致。
     """
     root_row = conn.execute(
         "SELECT * FROM trust_roots WHERE version = ?", (version,)
     ).fetchone()
     if root_row is None:
         raise ApiError(404, f"unknown trust root version '{version}'")
-    roots = certutils.parse_pem_chain(root_row["pem"])
-    snapshot = _load_snapshot(conn, snapshot_version)
     if windows is None:
         windows = conn.execute(
             "SELECT * FROM service_windows WHERE domain = ? ORDER BY start_utc, id",
             (domain,),
         ).fetchall()
+    window_maps = [_window_as_evidence(w) for w in windows]
 
-    usable: list[tuple[datetime, datetime]] = []
-    reports = []
-    for w in windows:
-        cert_row = conn.execute(
-            "SELECT * FROM certificates WHERE fingerprint_sha256 = ?",
-            (w["certificate_fingerprint"],),
+    snapshot_pem: str | None = None
+    if snapshot_version is not None:
+        snap_row = conn.execute(
+            "SELECT * FROM crl_snapshots WHERE version = ?", (snapshot_version,)
         ).fetchone()
-        report, intervals = _assess_window(
-            w, cert_row, roots, domain, eval_start, eval_end, snapshot
-        )
-        usable.extend(intervals)
-        reports.append(report)
+        if snap_row is None:
+            raise ApiError(404, f"unknown CRL snapshot version '{snapshot_version}'")
+        snapshot_pem = snap_row["pem"]
 
-    gaps = coverage.compute_gaps(eval_start, eval_end, usable)
-    return {
-        "domain": domain,
-        "eval_start": iso_z(eval_start),
-        "eval_end": iso_z(eval_end),
-        "trust_root_version": version,
-        "crl_snapshot_version": snapshot_version,
-        "has_gaps": bool(gaps),
-        "gaps": [{"start": iso_z(s), "end": iso_z(e)} for s, e in gaps],
-        "certificates": reports,
-        "evaluated_at": iso_z(now_utc()),
-    }
+    chain_pems: dict[str, str] = {}
+    for fp in {w["certificate_fingerprint"] for w in windows}:
+        cert_row = conn.execute(
+            "SELECT chain_pem FROM certificates WHERE fingerprint_sha256 = ?", (fp,)
+        ).fetchone()
+        chain_pems[fp] = cert_row["chain_pem"] if cert_row else None
+
+    try:
+        result = evidence.compute_from_materials(
+            domain=domain,
+            eval_start=eval_start,
+            eval_end=eval_end,
+            trust_root_pem=root_row["pem"],
+            windows=window_maps,
+            certificates=chain_pems,
+            snapshot_version=snapshot_version,
+            snapshot_pem=snapshot_pem,
+        )
+    except evidence.EvidenceError as exc:
+        # 走到这里说明已落库的不可变材料损坏：属于内部不一致，绝不静默放行。
+        raise ApiError(500, f"stored evaluation material is unreadable: {exc}") from exc
+    result["trust_root_version"] = version
+    result["evaluated_at"] = iso_z(now_utc())
+    return result
 
 
 def _evaluate(conn, plan_id, domain, eval_start, eval_end, version, snapshot_version) -> dict:
@@ -1007,46 +771,92 @@ def evaluate_plan(
 
 
 def approve_plan(plan_id: int) -> dict:
-    """批准计划：仅无断档时可批准，并冻结证书指纹、信任根版本与判定。"""
+    """批准计划：在同一一致性边界冻结判定。
+
+    批准事务内按当前窗口集合与计划选定的信任根/快照**重算一次**判定，
+    窗口集合读取、判定冻结与批准状态更新在同一事务内完成：
+    - 重算存在断档 → 409 拒绝（绝不依据陈旧评估批准）；
+    - 无断档 → 冻结实际参与评估的窗口集合、判定结果与各材料 SHA-256；
+      此后窗口删除、信任根/快照切换或再次批准都不会改写本次冻结内容。
+    历史批准（frozen_windows 为 NULL）缺少可还原窗口依据，不能生成证据包。
+    """
     with _write_lock, db.connect() as conn:
         plan = _get_plan(conn, plan_id)
         if plan["status"] == "approved":
             raise ApiError(409, "plan is already approved")
-        ev = conn.execute(
-            "SELECT * FROM evaluations WHERE plan_id = ? ORDER BY id DESC LIMIT 1",
-            (plan_id,),
-        ).fetchone()
-        if ev is None:
-            raise ApiError(409, "plan has no evaluation; run evaluate first")
-        verdict = json.loads(ev["result_json"])
+        version = plan["trust_root_version"]
+        snapshot_version = plan["crl_snapshot_version"]
+
+        # 批准边界：读取当前实际参与评估的窗口集合并重算判定。
+        window_rows = conn.execute(
+            "SELECT * FROM service_windows WHERE domain = ? ORDER BY start_utc, id",
+            (plan["domain"],),
+        ).fetchall()
+        frozen_windows = [evidence.frozen_window(w) for w in window_rows]
+        verdict = _compute_evaluation(
+            conn,
+            plan["domain"],
+            parse_ts(plan["eval_start"]),
+            parse_ts(plan["eval_end"]),
+            version,
+            snapshot_version,
+        )
         if verdict["has_gaps"]:
             raise ApiError(
                 409,
                 f"plan has {len(verdict['gaps'])} coverage gap(s);"
                 " only gap-free plans can be approved",
             )
-        fps = sorted(
-            {
-                r["certificate_fingerprint"]
-                for r in conn.execute(
-                    "SELECT DISTINCT certificate_fingerprint FROM service_windows"
-                    " WHERE domain = ?",
-                    (plan["domain"],),
-                ).fetchall()
-            }
-        )
+
+        # 冻结材料哈希（信任根/快照 PEM 与逐窗口证书链 PEM）。
+        root_row = conn.execute(
+            "SELECT pem FROM trust_roots WHERE version = ?", (version,)
+        ).fetchone()
+        snapshot_pem = None
+        if snapshot_version is not None:
+            snap_row = conn.execute(
+                "SELECT pem FROM crl_snapshots WHERE version = ?", (snapshot_version,)
+            ).fetchone()
+            snapshot_pem = snap_row["pem"] if snap_row else None
+        cert_hashes = {}
+        for w in frozen_windows:
+            fp = w["certificate_fingerprint"]
+            if fp in cert_hashes:
+                continue
+            cert_row = conn.execute(
+                "SELECT chain_pem FROM certificates WHERE fingerprint_sha256 = ?", (fp,)
+            ).fetchone()
+            cert_hashes[fp] = (
+                evidence.sha256_text(cert_row["chain_pem"]) if cert_row else None
+            )
+        material_hashes = {
+            "trust_root_pem_sha256": (
+                evidence.sha256_text(root_row["pem"]) if root_row else None
+            ),
+            "crl_snapshot_pem_sha256": (
+                evidence.sha256_text(snapshot_pem) if snapshot_pem is not None else None
+            ),
+            "certificate_pem_sha256": cert_hashes,
+        }
+
+        fps = sorted({w["certificate_fingerprint"] for w in frozen_windows})
         ts = iso_z(now_utc())
+        # 注意：批准的边界重算只用于冻结判定，不额外写入评估历史
+        # （评估历史仅由创建/重评产生，保持既有接口语义）。
         cur = conn.execute(
             "INSERT INTO approvals (plan_id, trust_root_version, crl_snapshot_version,"
-            " cert_fingerprints, verdict_json, superseded, created_at)"
-            " VALUES (?, ?, ?, ?, ?, 0, ?)",
+            " cert_fingerprints, verdict_json, superseded, created_at,"
+            " frozen_windows_json, frozen_materials_json)"
+            " VALUES (?, ?, ?, ?, ?, 0, ?, ?, ?)",
             (
                 plan_id,
-                ev["trust_root_version"],
-                ev["crl_snapshot_version"],
+                version,
+                snapshot_version,
                 json.dumps(fps),
-                ev["result_json"],
+                json.dumps(verdict),
                 ts,
+                json.dumps(frozen_windows),
+                json.dumps(material_hashes),
             ),
         )
         conn.execute(
@@ -1393,3 +1203,104 @@ def commit_window_change(
         "created_windows": created,
         "plans_marked_pending_review": affected,
     }
+
+
+# ---------------------------------------------------------------------------
+# 批准证据包（导出 / 离线复核）
+# ---------------------------------------------------------------------------
+
+def _get_approval(conn, approval_id: int):
+    row = conn.execute(
+        "SELECT * FROM approvals WHERE id = ?", (approval_id,)
+    ).fetchone()
+    if row is None:
+        raise ApiError(404, f"unknown approval id {approval_id}")
+    return row
+
+
+def build_evidence_package(approval_id: int) -> dict:
+    """为一次批准生成自包含证据包（dict；ZIP 字节由路由层封装）。
+
+    证据包只引用批准同一一致性边界冻结的内容：
+    窗口集合取 approvals.frozen_windows_json，判定取 verdict_json，
+    信任根/快照/证书链 PEM 按冻结版本与指纹从不可变库表补齐并核对哈希。
+    既有批准缺少冻结窗口依据时明确返回不可复核（422），不按当前窗口补齐。
+    """
+    with db.connect() as conn:
+        approval = _get_approval(conn, approval_id)
+        plan = conn.execute(
+            "SELECT * FROM plans WHERE id = ?", (approval["plan_id"],)
+        ).fetchone()
+        if plan is None:
+            raise ApiError(404, f"plan {approval['plan_id']} for approval not found")
+        if approval["frozen_windows_json"] is None:
+            raise ApiError(
+                422,
+                f"approval {approval_id} is not reviewable: it predates the"
+                " evidence-freeze change and carries no frozen service-window set"
+                " (cannot reconstruct the actual evaluation basis; current windows"
+                " are never used to backfill)",
+            )
+        frozen_windows = json.loads(approval["frozen_windows_json"])
+        frozen_materials = json.loads(approval["frozen_materials_json"])
+        verdict = json.loads(approval["verdict_json"])
+        verdict["_approval_created_at"] = approval["created_at"]
+
+        root_row = conn.execute(
+            "SELECT * FROM trust_roots WHERE version = ?",
+            (approval["trust_root_version"],),
+        ).fetchone()
+        if root_row is None:
+            raise ApiError(
+                422,
+                f"frozen trust root version '{approval['trust_root_version']}' is"
+                " no longer present; evidence package cannot be assembled",
+            )
+
+        snapshot_pem = None
+        if approval["crl_snapshot_version"] is not None:
+            snap_row = conn.execute(
+                "SELECT * FROM crl_snapshots WHERE version = ?",
+                (approval["crl_snapshot_version"],),
+            ).fetchone()
+            if snap_row is None:
+                raise ApiError(
+                    422,
+                    f"frozen CRL snapshot '{approval['crl_snapshot_version']}' is"
+                    " no longer present; evidence package cannot be assembled",
+                )
+            snapshot_pem = snap_row["pem"]
+
+        certificates: dict[str, str] = {}
+        for fp in {w["certificate_fingerprint"] for w in frozen_windows}:
+            cert_row = conn.execute(
+                "SELECT chain_pem FROM certificates WHERE fingerprint_sha256 = ?",
+                (fp,),
+            ).fetchone()
+            if cert_row is None:
+                raise ApiError(
+                    422,
+                    f"frozen certificate {fp} is no longer present;"
+                    " evidence package cannot be assembled",
+                )
+            certificates[fp] = cert_row["chain_pem"]
+
+        try:
+            package = evidence.build_package(
+                approval_id=approval["id"],
+                plan_id=approval["plan_id"],
+                domain=plan["domain"],
+                eval_start=plan["eval_start"],
+                eval_end=plan["eval_end"],
+                trust_root_version=approval["trust_root_version"],
+                trust_root_pem=root_row["pem"],
+                crl_snapshot_version=approval["crl_snapshot_version"],
+                crl_snapshot_pem=snapshot_pem,
+                windows=frozen_windows,
+                certificates=certificates,
+                frozen_verdict=verdict,
+                frozen_material_hashes=frozen_materials,
+            )
+        except evidence.EvidenceError as exc:
+            raise ApiError(422, f"cannot assemble evidence package: {exc.message}") from exc
+    return package

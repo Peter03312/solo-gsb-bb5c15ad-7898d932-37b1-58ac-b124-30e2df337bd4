@@ -64,13 +64,18 @@ CREATE TABLE IF NOT EXISTS evaluations (
 CREATE INDEX IF NOT EXISTS idx_evaluations_plan ON evaluations(plan_id);
 
 CREATE TABLE IF NOT EXISTS approvals (
-    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
-    plan_id             INTEGER NOT NULL REFERENCES plans(id),
-    trust_root_version  TEXT NOT NULL,
-    cert_fingerprints   TEXT NOT NULL,          -- JSON 数组，批准时冻结
-    verdict_json        TEXT NOT NULL,          -- 批准时冻结的判定结果
-    superseded          INTEGER NOT NULL DEFAULT 0,
-    created_at          TEXT NOT NULL
+    id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+    plan_id               INTEGER NOT NULL REFERENCES plans(id),
+    trust_root_version    TEXT NOT NULL,
+    cert_fingerprints     TEXT NOT NULL,          -- JSON 数组，批准时冻结
+    verdict_json          TEXT NOT NULL,          -- 批准时冻结的判定结果
+    superseded            INTEGER NOT NULL DEFAULT 0,
+    created_at            TEXT NOT NULL,
+    -- 本轮（证据包）新增：批准同一一致性边界冻结的实际参与评估的窗口集合；
+    -- 历史批准为 NULL → 缺少可还原窗口依据，证据包不可复核。
+    frozen_windows_json   TEXT,
+    -- 批准边界冻结的各材料 SHA-256（信任根/CRL 快照/逐证书链 PEM）。
+    frozen_materials_json TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_approvals_plan ON approvals(plan_id);
 
@@ -105,6 +110,9 @@ _COLUMN_MIGRATIONS = (
     ("plans", "crl_snapshot_version", "TEXT"),
     ("evaluations", "crl_snapshot_version", "TEXT"),
     ("approvals", "crl_snapshot_version", "TEXT"),
+    # 证据包：旧库的既有批准这两列为 NULL，显式标记为不可复核。
+    ("approvals", "frozen_windows_json", "TEXT"),
+    ("approvals", "frozen_materials_json", "TEXT"),
 )
 
 

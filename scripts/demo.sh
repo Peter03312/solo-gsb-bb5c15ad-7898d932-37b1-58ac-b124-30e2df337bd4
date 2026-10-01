@@ -157,4 +157,61 @@ curl -s -w "\nHTTP %{http_code}\n" -X POST "$BASE/window-changes/commit" \
   -H 'Content-Type: application/json' \
   -d "{\"domain\":\"demo.example.com\",\"change_token\":\"$TOKEN\",\"delete_window_ids\":[$CUR_WIN],\"add_windows\":[{\"certificate_fingerprint\":\"$CUR_FP\",\"role\":\"current\",\"start\":\"2026-01-01T00:00:00Z\",\"end\":\"2026-07-01T00:00:00Z\"}]}"
 
+echo "==> 13. 批准证据包：导出 → 离线复核"
+# 取 demo.example.com 当前最新的一次批准（经本轮代码批准、冻结了窗口集合）
+EVID_AID=$(curl -s "$BASE/plans/1/approvals" \
+  | python3 -c "import json,sys;print([a['id'] for a in json.load(sys.stdin)['items'] if not a['superseded']][-1])")
+echo "current approval id = $EVID_AID"
+
+echo "-- 13.1 下载证据包 ZIP（域名/区间/判定 + 冻结窗口 + 证书链 + 信任根 + CRL 快照）"
+curl -s "$BASE/approvals/$EVID_AID/evidence" -o /tmp/approval-evidence.zip
+python3 -c "import zipfile;print('\n'.join('  '+n for n in zipfile.ZipFile('/tmp/approval-evidence.zip').namelist()))"
+
+echo "-- 13.2 在「另一台离线机器」上只凭包内材料复核（HTTP，结果一致）"
+curl -s -X POST "$BASE/evidence/verify" -H 'Content-Type: application/zip' \
+  --data-binary @/tmp/approval-evidence.zip \
+  | python3 -c "import json,sys;d=json.load(sys.stdin);print('result =',d['result'],'| differences =',d['differences'])"
+
+echo "-- 13.3 也可不跑服务，用命令行离线复核（exit 0=一致 / 2=不一致 / 1=包非法）"
+python3 -m scripts.verify_evidence /tmp/approval-evidence.zip || true
+
+echo "-- 13.4 篡改冻结判定后重算 → inconsistent 并给出差异路径"
+curl -s "$BASE/approvals/$EVID_AID/evidence?format=json" -o /tmp/approval-evidence.json
+python3 - <<'PYEOF'
+import json, hashlib
+p = json.load(open('/tmp/approval-evidence.json'))
+p['decision']['verdict']['has_gaps'] = True
+body = {k: v for k, v in p.items() if k != 'manifest_sha256'}
+p['manifest_sha256'] = hashlib.sha256(
+    json.dumps(body, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+json.dump(p, open('/tmp/approval-evidence-tampered.json', 'w'))
+PYEOF
+curl -s -X POST "$BASE/evidence/verify" -H 'Content-Type: application/json' \
+  --data-binary @/tmp/approval-evidence-tampered.json \
+  | python3 -c "import json,sys;d=json.load(sys.stdin);print('result =',d['result'],'| differences =',[x['path'] for x in d['differences']])"
+
+echo "-- 13.5 不改清单哈希的篡改 → 422 PACKAGE_INTEGRITY_ERROR（可解释错误）"
+python3 - <<'PYEOF'
+import json
+p = json.load(open('/tmp/approval-evidence.json'))
+p['domain'] = 'attacker.example.com'
+json.dump(p, open('/tmp/approval-evidence-badhash.json', 'w'))
+PYEOF
+curl -s -w "\nHTTP %{http_code}\n" -X POST "$BASE/evidence/verify" \
+  -H 'Content-Type: application/json' --data-binary @/tmp/approval-evidence-badhash.json
+
+echo "-- 13.6 历史批准缺少可还原窗口依据 → 422 不可复核（不按当前窗口补齐）"
+# 演示数据中的首批批准若由旧版本写入，evidence_reviewable=false 且导出被拒
+LEGACY_AID=$(curl -s "$BASE/plans/1/approvals" \
+  | python3 -c "import json,sys
+items=json.load(sys.stdin)['items']
+old=[a['id'] for a in items if not a['evidence_reviewable']]
+print(old[0] if old else '')")
+if [ -n "$LEGACY_AID" ]; then
+  curl -s -w "\nHTTP %{http_code}\n" "$BASE/approvals/$LEGACY_AID/evidence"
+else
+  echo "   （当前演示库的批准均由本轮代码写入，全部可复核；"
+  echo "     迁移前的既有批准 evidence_reviewable=false，导出返回 422 not reviewable）"
+fi
+
 echo "demo done."

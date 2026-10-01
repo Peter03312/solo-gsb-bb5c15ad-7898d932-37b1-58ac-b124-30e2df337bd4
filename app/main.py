@@ -4,9 +4,9 @@ from __future__ import annotations
 import contextlib
 
 from fastapi import FastAPI, Query, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 
-from . import db, service
+from . import db, evidence, service
 from .models import (
     CertificateImport,
     CrlSnapshotImport,
@@ -42,6 +42,15 @@ app = FastAPI(
 @app.exception_handler(service.ApiError)
 async def api_error_handler(request: Request, exc: service.ApiError):
     return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
+
+
+@app.exception_handler(evidence.EvidenceError)
+async def evidence_error_handler(request: Request, exc: evidence.EvidenceError):
+    """证据包复核的可解释错误：携带稳定错误码（缺项/指纹/版本/非法时间等）。"""
+    return JSONResponse(
+        status_code=422,
+        content={"code": exc.code, "detail": exc.message},
+    )
 
 
 @app.get("/")
@@ -252,3 +261,49 @@ def plan_evaluations(plan_id: int):
 def plan_approvals(plan_id: int):
     """批准历史（含被取代的冻结判定，全部保留）。"""
     return {"items": service.list_approvals(plan_id)}
+
+
+# ----------------------------- 批准证据包（导出 / 离线复核） -----------------------------
+
+@app.get(f"{API}/approvals/{{approval_id}}/evidence", tags=["evidence"])
+def download_approval_evidence(approval_id: int, format: str = Query(default="zip")):
+    """导出一次批准的可下载证据包（域名/评估区间/判定、实际参与评估的窗口集合、
+    证书链、信任根与选用的 CRL 快照均取自批准一致性边界冻结的内容）。
+
+    - format=zip（默认）→ application/zip，含 manifest.json 与逐份 PEM；
+    - format=json → 直接返回内联 JSON 证据包。
+    既有批准缺少可还原窗口依据 → 422，不可复核，不按当前窗口补齐。
+    """
+    package = service.build_evidence_package(approval_id)
+    if format == "json":
+        return package
+    if format != "zip":
+        return JSONResponse(
+            status_code=400,
+            content={"detail": f"unsupported format '{format}', use 'zip' or 'json'"},
+        )
+    data = evidence.package_to_zip(package)
+    filename = f"approval-{approval_id}-plan-{package['approval']['plan_id']}-evidence.zip"
+    return Response(
+        content=data,
+        media_type="application/zip",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@app.post(f"{API}/evidence/verify", tags=["evidence"])
+async def verify_evidence(request: Request):
+    """离线复核证据包：只使用包内材料重算覆盖、X.509 与撤销结论。
+
+    接受 application/json（内联证据包）或 application/zip（导出的证据 ZIP）。
+    不读取、不导入、不修改任何当前业务数据。判定一致 → consistent；
+    不一致 → inconsistent 并给出逐路径差异原因；
+    缺项/指纹不符/版本不符/非法时间 → 422 可解释错误（含错误码）。
+    """
+    body = await request.body()
+    ctype = request.headers.get("content-type", "").lower()
+    if body[:2] == b"PK" or "application/zip" in ctype:
+        package = evidence.package_from_zip(body)
+    else:
+        package = evidence.package_from_json_bytes(body)
+    return evidence.verify_package(package)
